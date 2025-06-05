@@ -1,0 +1,26 @@
+name = "weather-slack-updater"
+main = "src/index.js" # Entry point for your Worker script
+compatibility_date = "2023-12-01" # Use a recent compatibility date
+
+# KV Namespace for storing user configurations
+# Create this in the Cloudflare dashboard or via wrangler:
+# `wrangler kv:namespace create USER_CONFIGS`
+# Then, update the 'id' and 'preview_id' below.
+[[kv_namespaces]]
+binding = "USER_CONFIGS" # How you'll access it in your code (env.USER_CONFIGS)
+id = "your_kv_namespace_id_obtained_from_wrangler_or_dashboard"
+# preview_id = "your_kv_namespace_preview_id_for_local_testing" # For `wrangler dev`
+
+# Cron Trigger to run the weather check periodically
+# This example runs every 30 minutes. Adjust as needed.
+# See https://developers.cloudflare.com/workers/platform/triggers/cron-triggers/#cron-expressions
+[[triggers]]
+crons = ["*/30 * * * *"] # e.g., "0 * * * *" for hourly at the start of the hour
+
+# Secrets - Store sensitive data like API keys here.
+# Add these using `wrangler secret put <SECRET_NAME>`
+# e.g., `wrangler secret put WEATHER_API_KEY`
+# e.g., `wrangler secret put ENCRYPTION_KEY_SECRET` (for encrypting Slack tokens)
+
+# [vars] # For non-secret configuration if needed
+# LOG_LEVEL = "INFO"
