@@ -8,8 +8,7 @@ compatibility_date = "2023-12-01" # Use a recent compatibility date
 # Then, update the 'id' and 'preview_id' below.
 [[kv_namespaces]]
 binding = "USER_CONFIGS" # How you'll access it in your code (env.USER_CONFIGS)
-id = "your_kv_namespace_id_obtained_from_wrangler_or_dashboard"
-# preview_id = "your_kv_namespace_preview_id_for_local_testing" # For `wrangler dev`
+id = "7973ddc2c5144fa4999edfeb8492d98c"
 
 # Cron Trigger to run the weather check periodically
 # This example runs every 30 minutes. Adjust as needed.
