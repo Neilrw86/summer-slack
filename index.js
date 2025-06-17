@@ -1,285 +1,185 @@
-// /weather-slack-updater/src/index.js
+/**
+ * Welcome to Cloudflare Workers! This is your first worker.
+ *
+ * - Run `npm run dev` in your terminal to start a development server
+ * - Open a browser tab at http://localhost:8787/ to see your worker in action
+ * - Run `npm run deploy` to publish your worker
+ *
+ * Learn more at https://developers.cloudflare.com/workers/
+ */
 
-const CONFIG_KEY_PREFIX = "user_config::";
+export default {
+  async fetch(request, env, ctx) {
+    // This 'fetch' handler is for responding to HTTP requests, like Slack slash commands.
+    // If you ONLY want the scheduled automatic update for a pre-configured user,
+    // you might not need this handler, or you could simplify it.
 
-// --- Cryptography Helpers for Slack Tokens ---
-// Requires an ENCRYPTION_KEY_SECRET to be set in your Worker's secrets.
-// This should be a securely generated, base64-encoded 32-byte key for AES-256-GCM.
-// Generate one with: `openssl rand -base64 32` then set with `wrangler secret put ENCRYPTION_KEY_SECRET`
+    if (request.method !== 'POST') {
+      return new Response('Expected POST request for Slack command', { status: 405 });
+    }
 
-async function getEncryptionKey(env) {
-  if (!env.ENCRYPTION_KEY_SECRET) {
-    console.error("FATAL: ENCRYPTION_KEY_SECRET is not configured. Cannot encrypt/decrypt tokens.");
-    throw new Error("Server configuration error: Encryption key missing.");
-  }
-  try {
-    // Decode the base64 secret to get the raw key bytes
-    const rawKey = Uint8Array.from(atob(env.ENCRYPTION_KEY_SECRET), c => c.charCodeAt(0));
-    return crypto.subtle.importKey(
-      "raw",
-      rawKey,
-      { name: "AES-GCM" },
-      false, // non-extractable
-      ["encrypt", "decrypt"]
-    );
-  } catch (e) {
-    console.error("Failed to import encryption key:", e.message);
-    throw new Error("Server configuration error: Invalid encryption key.");
-  }
-}
+    // IMPORTANT: Verify Slack requests for security!
+    // This is a simplified example. In a production app, you MUST verify requests.
+    // See: https://api.slack.com/authentication/verifying-requests-from-slack
+    // You would use env.SLACK_SIGNING_SECRET, request headers, and the request body.
+    // For brevity, full verification logic is omitted here but is crucial.
+    // const isVerified = await verifySlackRequest(request, env.SLACK_SIGNING_SECRET);
+    // if (!isVerified) {
+    //   return new Response('Slack request verification failed', { status: 403 });
+    // }
 
-// Helper to convert Uint8Array to a Base64 string
-function uint8ArrayToBase64(arrayBuffer) {
-  let binary = '';
-  const bytes = new Uint8Array(arrayBuffer);
-  const len = bytes.byteLength;
-  for (let i = 0; i < len; i++) {
-    binary += String.fromCharCode(bytes[i]);
-  }
-  return btoa(binary);
-}
-
-async function encryptData(data, env) {
-  const key = await getEncryptionKey(env);
-  const iv = crypto.getRandomValues(new Uint8Array(12)); // Initialization Vector for AES-GCM
-  const encodedData = new TextEncoder().encode(data);
-
-  const encryptedBuffer = await crypto.subtle.encrypt(
-    { name: "AES-GCM", iv: iv },
-    key,
-    encodedData
-  );
-
-  // Combine IV and ciphertext, then base64 encode for storage
-  const combined = new Uint8Array(iv.length + encryptedBuffer.byteLength);
-  combined.set(iv, 0);
-  combined.set(new Uint8Array(encryptedBuffer), iv.length);
-  return uint8ArrayToBase64(combined.buffer); // Store as base64 string
-}
-
-async function decryptData(encryptedDataB64, env) {
-  const key = await getEncryptionKey(env);
-  const combined = Uint8Array.from(atob(encryptedDataB64), c => c.charCodeAt(0));
-
-  const iv = combined.slice(0, 12);
-  const ciphertext = combined.slice(12);
-
-  const decryptedBuffer = await crypto.subtle.decrypt(
-    { name: "AES-GCM", iv: iv },
-    key,
-    ciphertext
-  );
-
-  return new TextDecoder().decode(decryptedBuffer);
-}
-
-// --- KV Store Interaction ---
-
-async function saveUserConfig(env, userId, configData) {
-  if (!userId || !configData.slackToken || !configData.slackChannel || !configData.location) {
-    throw new Error("Missing required configuration fields for saving.");
-  }
-  const encryptedSlackToken = await encryptData(configData.slackToken, env);
-  const storableConfig = {
-    ...configData,
-    slackToken: encryptedSlackToken, // Store the encrypted token
-  };
-  await env.USER_CONFIGS.put(`${CONFIG_KEY_PREFIX}${userId}`, JSON.stringify(storableConfig));
-  console.log(`Configuration saved for user: ${userId}`);
-}
-
-async function getUserConfig(env, userId) {
-  const configStr = await env.USER_CONFIGS.get(`${CONFIG_KEY_PREFIX}${userId}`);
-  if (!configStr) {
-    return null;
-  }
-  const storedConfig = JSON.parse(configStr);
-  // Decrypt the Slack token before returning the config
-  const decryptedSlackToken = await decryptData(storedConfig.slackToken, env);
-  return {
-    ...storedConfig,
-    slackToken: decryptedSlackToken,
-  };
-}
-
-async function getAllUserConfigs(env) {
-  const listResult = await env.USER_CONFIGS.list({ prefix: CONFIG_KEY_PREFIX });
-  const configs = {};
-  for (const key of listResult.keys) {
-    const userId = key.name.replace(CONFIG_KEY_PREFIX, "");
     try {
-      const config = await getUserConfig(env, userId); // Re-uses single get logic with decryption
-      if (config) {
-        configs[userId] = config;
+      const formData = await request.formData();
+      const command = formData.get('command');
+      const location = formData.get('text')?.trim(); // Location from slash command
+      const userId = formData.get('user_id');
+      // const responseUrl = formData.get('response_url'); // For deferred responses
+
+      if (!location) {
+        return new Response('Please provide a location. Usage: /weatherstatus <location>', {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+
+      // 1. Fetch weather data
+      const weather = await fetchWeather(location, env.WEATHER_API_KEY);
+
+      // 2. Process weather data
+      const tempF = convertKelvinToFahrenheit(weather.main.temp);
+      const isRaining = checkIfRaining(weather.weather);
+
+      let responseText = `Weather in ${location}: ${tempF.toFixed(1)}°F. `;
+      responseText += isRaining ? "It's raining." : "It's not raining.";
+
+      // 3. Check conditions and set Slack status
+      if (tempF > 85 && !isRaining) {
+        const statusText = "in a meeting";
+        const statusEmoji = ":calendar:"; // You can customize this
+        await setSlackUserStatus(userId, env.SLACK_BOT_TOKEN, statusText, statusEmoji);
+        responseText += ` Your Slack status has been updated to "${statusText} ${statusEmoji}".`;
+      } else {
+        responseText += " Conditions not met to change status (requires >85°F and no rain).";
+      }
+
+      // Respond to Slack. Slack expects a 200 OK.
+      // For slash commands, you can return a JSON payload for richer messages.
+      // Here, we send a simple text response.
+      return new Response(JSON.stringify({ response_type: 'ephemeral', text: responseText }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+
+    } catch (error) {
+      console.error('Error processing Slack command:', error);
+      return new Response(JSON.stringify({ response_type: 'ephemeral', text: `Sorry, an error occurred: ${error.message}` }), {
+        status: 200, // Slack expects 200 even for errors displayed to user
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }
+  },
+
+  // This 'scheduled' handler is triggered by the cron schedule in wrangler.toml
+  async scheduled(event, env, ctx) {
+    console.log(`Scheduled event triggered at: ${new Date(event.scheduledTime).toISOString()}`);
+
+    const location = env.DEFAULT_LOCATION;
+    const userId = env.SLACK_USER_ID_TO_UPDATE;
+    const weatherApiKey = env.WEATHER_API_KEY;
+    const slackBotToken = env.SLACK_BOT_TOKEN;
+
+    if (!location || !userId) {
+      console.error("Error: DEFAULT_LOCATION or SLACK_USER_ID_TO_UPDATE secret is not set for the scheduled task.");
+      return;
+    }
+    if (!weatherApiKey) {
+      console.error("Error: WEATHER_API_KEY secret is not set.");
+      return;
+    }
+    if (!slackBotToken) {
+      console.error("Error: SLACK_BOT_TOKEN secret is not set.");
+      return;
+    }
+
+    try {
+      console.log(`Fetching weather for scheduled task: Location - ${location}, UserID - ${userId}`);
+      const weather = await fetchWeather(location, weatherApiKey);
+      const tempF = convertKelvinToFahrenheit(weather.main.temp);
+      const isRaining = checkIfRaining(weather.weather);
+
+      if (tempF > 85 && !isRaining) {
+        const statusText = "in a meeting";
+        const statusEmoji = ":calendar:";
+        await setSlackUserStatus(userId, slackBotToken, statusText, statusEmoji);
+        console.log(`Scheduled: Slack status updated for user ${userId} to "${statusText}" due to weather in ${location} (${tempF.toFixed(1)}°F, Not Raining).`);
+      } else {
+        console.log(`Scheduled: Conditions not met in ${location} for user ${userId}. Temp: ${tempF.toFixed(1)}°F, Raining: ${isRaining}. Status not changed.`);
       }
     } catch (error) {
-      console.error(`Failed to load or decrypt config for user ${userId}: ${error.message}`);
-      // Decide if you want to skip this user or halt (halting might be too drastic for a scheduled job)
+      console.error('Error during scheduled task:', error.message, error.stack ? error.stack : '');
     }
   }
-  return configs;
-}
+};
 
-// --- External API Interactions ---
-
-async function getWeatherData(location, apiKey) {
-  if (!apiKey) {
-    console.error("Weather API key is not configured in Worker secrets.");
-    throw new Error("Server configuration error: Weather API key missing.");
-  }
-  // Example using WeatherAPI.com - adapt to your chosen provider
-  const weatherApiUrl = `https://api.weatherapi.com/v1/current.json?key=${apiKey}&q=${encodeURIComponent(location)}&aqi=no`;
-
-  console.log(`Fetching weather for: ${location}`);
-  const response = await fetch(weatherApiUrl, { headers: { "User-Agent": "WeatherSlackUpdater/1.0" } });
+async function fetchWeather(location, apiKey) {
+  const apiUrl = `https://api.openweathermap.org/data/2.5/weather?q=${encodeURIComponent(location)}&appid=${apiKey}`;
+  const response = await fetch(apiUrl);
   if (!response.ok) {
-    const errorText = await response.text();
-    console.error(`Weather API error for ${location}: ${response.status} - ${errorText}`);
-    throw new Error(`Failed to fetch weather for ${location}. Status: ${response.status}`);
+    const errorData = await response.text();
+    throw new Error(`Weather API error (${response.status}): ${errorData}`);
   }
-  const data = await response.json();
-  return {
-    temperature: data.current.temp_c,
-    condition: data.current.condition.text,
-    // Ensure icon URL is HTTPS, WeatherAPI often provides protocol-relative URLs like //cdn.weatherapi.com/...
-    iconUrl: data.current.condition.icon
-      ? (data.current.condition.icon.startsWith('//') ? `https:${data.current.condition.icon}` : data.current.condition.icon)
-      : undefined,
-  };
+  return response.json();
 }
 
-async function postToSlack(userSlackToken, channel, messageText, blocks) {
-  console.log(`Posting to Slack channel ${channel} (token starts with ${userSlackToken.substring(0,10)}...)`);
-  const payload = {
-    channel: channel,
-    text: messageText, // Fallback text for notifications
-  };
-  if (blocks) {
-    payload.blocks = blocks; // For richer formatting
-  }
+function convertKelvinToFahrenheit(kelvin) {
+  return (kelvin - 273.15) * 9/5 + 32;
+}
 
-  const response = await fetch("https://slack.com/api/chat.postMessage", {
-    method: "POST",
+function checkIfRaining(weatherConditions) {
+  // OpenWeatherMap 'weather' is an array of condition objects.
+  // See: https://openweathermap.org/weather-conditions
+  if (!weatherConditions || weatherConditions.length === 0) {
+    return false;
+  }
+  // Check for codes in the 2xx (Thunderstorm), 3xx (Drizzle), 5xx (Rain) ranges.
+  return weatherConditions.some(condition => {
+    const mainCategory = Math.floor(condition.id / 100);
+    return mainCategory === 2 || mainCategory === 3 || mainCategory === 5;
+  });
+}
+
+async function setSlackUserStatus(userId, botToken, statusText, statusEmoji) {
+  const apiUrl = 'https://slack.com/api/users.profile.set';
+  const payload = {
+    profile: {
+      status_text: statusText,
+      status_emoji: statusEmoji,
+      status_expiration: 0, // 0 means status does not automatically clear
+    },
+    user: userId, // Specify the user ID for whom to set the status
+  };
+
+  const response = await fetch(apiUrl, {
+    method: 'POST',
     headers: {
-      "Authorization": `Bearer ${userSlackToken}`,
-      "Content-Type": "application/json; charset=utf-8",
+      'Authorization': `Bearer ${botToken}`,
+      'Content-Type': 'application/json; charset=utf-8',
     },
     body: JSON.stringify(payload),
   });
 
-  const responseData = await response.json();
-  if (!response.ok || !responseData.ok) {
-    console.error(`Slack API error: ${response.status}`, responseData.error || await response.text());
-    throw new Error(`Slack API error: ${responseData.error || 'Unknown error during Slack post'}`);
+  const data = await response.json();
+  if (!data.ok) {
+    console.error('Slack API Error (users.profile.set):', data.error, data);
+    throw new Error(`Slack API error setting status: ${data.error}`);
   }
-  console.log("Message posted to Slack successfully.");
-  return responseData;
+  console.log(`Slack status updated successfully for user ${userId}:`, data.ok);
+  return data;
 }
 
-// --- Cloudflare Worker Event Handlers ---
-
-export default {
-  async scheduled(event, env, ctx) {
-    console.log(`Cron job triggered: ${event.cron} at ${new Date(event.scheduledTime).toISOString()}`);
-    const weatherApiKey = env.WEATHER_API_KEY;
-
-    if (!weatherApiKey) {
-      console.error("FATAL: WEATHER_API_KEY secret is not set. Scheduled task cannot run.");
-      return;
-    }
-    if (!env.ENCRYPTION_KEY_SECRET) {
-      console.error("FATAL: ENCRYPTION_KEY_SECRET secret is not set. Cannot process user data. Scheduled task cannot run.");
-      return;
-    }
-
-    const allConfigs = await getAllUserConfigs(env);
-    let successCount = 0;
-    let failureCount = 0;
-
-    for (const [userId, config] of Object.entries(allConfigs)) {
-      if (!config || !config.slackToken || !config.slackChannel || !config.location) {
-        console.warn(`Skipping user ${userId} due to incomplete or invalid configuration after load.`);
-        failureCount++;
-        continue;
-      }
-      try {
-        console.log(`Processing user: ${userId} for location: ${config.location}`);
-        const weather = await getWeatherData(config.location, weatherApiKey);
-
-        const fallbackText = `Weather in ${config.location}: ${weather.temperature}°C, ${weather.condition}.`;
-        const blocks = [
-          {
-            "type": "section",
-            "text": {
-              "type": "mrkdwn",
-              "text": `Hi ${userId}! Here's your weather update for *${config.location}*:`
-            }
-          },
-          {
-            "type": "section",
-            "fields": [
-              { "type": "mrkdwn", "text": `*Temperature:*\n${weather.temperature}°C` },
-              { "type": "mrkdwn", "text": `*Condition:*\n${weather.condition}` }
-            ],
-            "accessory": weather.iconUrl ? {
-              "type": "image",
-              "image_url": weather.iconUrl, // Already ensured it's HTTPS or absolute
-              "alt_text": weather.condition
-            } : undefined
-          }
-        ];
-
-        await postToSlack(config.slackToken, config.slackChannel, fallbackText, blocks);
-        successCount++;
-      } catch (error) {
-        console.error(`Error processing scheduled update for user ${userId}: ${error.message}`, error.stack ? error.stack : '');
-        failureCount++;
-      }
-    }
-    console.log(`Scheduled task finished. Successes: ${successCount}, Failures: ${failureCount}`);
-  },
-
-  async fetch(request, env, ctx) {
-    const url = new URL(request.url);
-
-    if (request.method === "POST" && url.pathname === "/configure") {
-      // IMPORTANT: This endpoint MUST be secured in a production environment!
-      // Options: Cloudflare Access, API Key authentication, mTLS, etc.
-      // For simplicity, this example does not include authentication.
-      if (!env.ENCRYPTION_KEY_SECRET) {
-         return new Response(JSON.stringify({ error: "Server configuration error: Cannot save configuration securely." }), {
-            status: 503, headers: { "Content-Type": "application/json" },
-         });
-      }
-      try {
-        const body = await request.json();
-        const { userId, slackToken, slackChannel, location } = body;
-
-        if (!userId || !slackToken || !slackChannel || !location) {
-          return new Response(JSON.stringify({ error: "Missing required fields: userId, slackToken, slackChannel, location" }), {
-            status: 400, headers: { "Content-Type": "application/json" },
-          });
-        }
-        // Add more validation here (e.g., token format, channel format)
-
-        await saveUserConfig(env, userId, { slackToken, slackChannel, location });
-        return new Response(JSON.stringify({ message: `Configuration for user ${userId} saved successfully.` }), {
-          status: 201, headers: { "Content-Type": "application/json" },
-        });
-      } catch (error) {
-        console.error("Configuration endpoint error:", error.message, error.stack ? error.stack : '');
-        const userFacingError = error.message.startsWith("Server configuration error") ? error.message : "Failed to save configuration.";
-        return new Response(JSON.stringify({ error: userFacingError }), {
-          status: error.message.startsWith("Server configuration error") ? 503 : 500,
-          headers: { "Content-Type": "application/json" },
-        });
-      }
-    }
-
-    if (url.pathname === "/health") {
-      return new Response("OK", { status: 200 });
-    }
-
-    return new Response("Not Found. Available endpoints: POST /configure, GET /health", { status: 404 });
-  },
-};
+// Note on Slack Request Verification:
+// For a production app, you MUST implement Slack request verification.
+// This involves using the `X-Slack-Request-Timestamp` and `X-Slack-Signature` headers,
+// the raw request body, and your `SLACK_SIGNING_SECRET`.
+// Cloudflare Workers provide the `crypto.subtle` API for HMAC SHA256 hashing.
+// See: https://api.slack.com/authentication/verifying-requests-from-slack

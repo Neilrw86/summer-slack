@@ -1,113 +1,181 @@
-# Weather-Sensitive Slack Status Updater
+# Slack Weather Status Updater
 
-This Python bot automatically updates your Slack status based on the current weather conditions. It fetches weather data from the OpenWeather API and sets your Slack status to "In a meeting" (or a custom status) if the temperature exceeds a predefined threshold (e.g., 82°F / 28°C).
+This project is a Cloudflare Worker that automatically checks the weather for a configured location. If the temperature is over 85°F and it's not raining, it updates a pre-defined Slack user's status to "in a meeting".
 
-## Features
+It can also optionally be configured to respond to a Slack slash command (`/weatherstatus <location>`) to perform the same check and status update for the user invoking the command.
 
-*   Fetches current temperature from OpenWeather API for a specified location.
-*   Updates Slack status (text and emoji) when the temperature is above a configurable threshold.
-*   Optionally sets a different status when the temperature is below the threshold.
-*   Configurable check interval.
+## Architecture Overview
 
-## Prerequisites
+The system primarily relies on a Cloudflare Worker triggered by a cron schedule. It fetches weather data from OpenWeatherMap and then interacts with the Slack API to update a user's status.
 
-*   Python 3.7+
-*   An [OpenWeather API Key](https://openweathermap.org/appid)
-*   A [Slack User Token](https://api.slack.com/authentication/token-types#user). The token needs the `users.profile:write` scope to change your status.
+### Core Automated Flow:
 
-## Setup
+```
++---------------------+      (Cron Trigger)     +--------------------------+
+| Cloudflare          | -----------------------> |   Cloudflare Worker      |
+| Scheduler           |                          |   (slack-weather-app)    |
+| (e.g., every hour)  |                          |   - scheduled handler    |
++---------------------+                          |   - Uses env secrets:    |
+                                                 |     DEFAULT_LOCATION     |
+                                                 |     SLACK_USER_ID        |
+                                                 +------------+-------------+
+                                                              |
+                                                              | 1. Fetch weather data for
+                                                              |    DEFAULT_LOCATION
+                                                              v
+                                                 +--------------------------+
+                                                 |   OpenWeatherMap API     |
+                                                 |   (using WEATHER_API_KEY)|
+                                                 +--------------------------+
+                                                              ^
+                                                              | 2. Weather data (temp, conditions)
+                                                              |
+                                                 +------------+-------------+
+                                                 |   Cloudflare Worker      |
+                                                 |   (processes weather)    |
+                                                 +------------+-------------+
+                                                              |
+                                                              | 3. If Temp > 85°F AND Not Raining
+                                                              |    (for SLACK_USER_ID_TO_UPDATE)
+                                                              v
+                                                 +--------------------------+
+                                                 |   Slack API              |
+                                                 |   (users.profile.set)    |
+                                                 |   (using SLACK_BOT_TOKEN)|
+                                                 +--------------------------+
+                                                              ^
+                                                              | 4. Status Updated
+                                                              |
+                                                 +------------+-------------+
+                                                 |   Target Slack User's    |
+                                                 |   Profile Status         |
+                                                 +--------------------------+
+```
 
-1.  **Clone the repository (if you haven't already):**
-    ```bash
-    git clone https://github.com/neilrw86/summer-slack
-    cd summer-slack
-    ```
+### Optional Slash Command Flow:
 
-2.  **Install dependencies:**
-    The required libraries are listed in `requirements.txt`. Install them using pip:
-    ```bash
-    pip install -r requirements.txt
-    ```
-    This will install `slack_sdk`, `requests`, and `python-dotenv`.
+```
++-----------------+   /weatherstatus <location>   +--------------------------+
+| Slack User      | -----------------------------> |   Cloudflare Worker      |
+| (in Slack)      |                                |   (slack-weather-app)    |
++-----------------+                                |   - fetch handler        |
+                                                 +------------+-------------+
+                                                              |
+                                                              | 1. Fetch weather data for
+                                                              |    <location> from command
+                                                              v
+                                                 +--------------------------+
+                                                 |   OpenWeatherMap API     |
+                                                 |   (using WEATHER_API_KEY)|
+                                                 +--------------------------+
+                                                              ^
+                                                              | 2. Weather data
+                                                              |
+                                                 +------------+-------------+
+                                                 |   Cloudflare Worker      |
+                                                 |   (processes weather)    |
+                                                 +------------+-------------+
+                                                              |
+                                                              | 3. If Temp > 85°F AND Not Raining
+                                                              |    (for invoking user)
+                                                              v
+                                                 +--------------------------+
+                                                 |   Slack API              |
+                                                 |   (users.profile.set)    |
+                                                 |   (using SLACK_BOT_TOKEN)|
+                                                 +--------------------------+
+                                                              ^
+                                                              | 4. Status Updated &
+                                                              |    Ephemeral msg to user
+                                                              |
+                                                 +------------+-------------+
+                                                 |   Invoking Slack User    |
+                                                 +--------------------------+
+```
 
-3.  **Configure Environment Variables:**
-    Create a `.env` file in the root directory of the project (and add `.env` to your `.gitignore` file!). Populate it with your API keys and preferences:
+## Key Components
 
-    ```env
-    # .env file
-    OPENWEATHER_API_KEY="your_openweather_api_key"
-    SLACK_USER_TOKEN="xoxp-your-slack-user-token"
+1.  **Cloudflare Worker (`slack-weather-app`):**
+    *   The core logic resides here (`src/index.js`).
+    *   **`scheduled` handler:** Triggered by a cron job (defined in `wrangler.toml`) to perform automatic checks.
+    *   **`fetch` handler:** (Optional) Responds to HTTP POST requests, typically from Slack slash commands.
+    *   Securely accesses API keys and configuration stored as Cloudflare secrets.
+2.  **Slack App:**
+    *   Required to obtain a **Bot User OAuth Token** with `users.profile:write` scope. This token allows the Worker to change user statuses.
+    *   If using the slash command, it's configured here with the Worker's URL as the Request URL.
+    *   Provides a **Signing Secret** to verify requests from Slack (important for the `fetch` handler).
+3.  **OpenWeatherMap API:**
+    *   Used to fetch current weather conditions (temperature, rain status) for a given location. Requires an API key.
+4.  **Cloudflare Scheduler:**
+    *   Defined by the `crons` entry in `wrangler.toml`, this service triggers the Worker's `scheduled` handler at regular intervals.
 
-    # Weather Configuration
-    OPENWEATHER_LOCATION="New York,US"  # e.g., "City,CountryCode", "ZipCode", or "lat=XX&lon=YY"
-    OPENWEATHER_UNITS="imperial"      # "imperial" for Fahrenheit, "metric" for Celsius, "standard" for Kelvin
-    TEMPERATURE_THRESHOLD="82"        # Temperature threshold (in units specified above)
+## Setup and Configuration
 
-    # Slack Status for when it's HOT
-    SLACK_STATUS_TEXT_HOT="In a meeting"
-    SLACK_STATUS_EMOJI_HOT=":calendar:" # e.g., :calendar:, :no_entry:, :fire:
+1.  **Create a Slack App:**
+    *   Go to api.slack.com/apps and create a new app.
+    *   Add the `users.profile:write` scope under "OAuth & Permissions" for Bot Tokens.
+    *   Install the app to your workspace.
+    *   Note down the **Bot User OAuth Token** (starts with `xoxb-`).
+    *   Note down the **Signing Secret** from "Basic Information" (if using slash commands).
+    *   (Optional) Create a Slash Command (e.g., `/weatherstatus`) and point its Request URL to your deployed Worker URL.
 
-    # Optional: Slack Status for when it's NOT hot (leave blank to clear status)
-    SLACK_STATUS_TEXT_NORMAL=""
-    SLACK_STATUS_EMOJI_NORMAL=""
+2.  **Get OpenWeatherMap API Key:**
+    *   Sign up at OpenWeatherMap and get an API key.
 
-    # How often to check the weather, in seconds
-    CHECK_INTERVAL_SECONDS="600" # e.g., 600 for 10 minutes, 3600 for 1 hour
-    ```
+3.  **Cloudflare Worker Setup:**
+    *   Clone this repository.
+    *   Install Wrangler CLI: `npm install -g wrangler`
+    *   Login to Cloudflare: `wrangler login`
+    *   Configure secrets (these are essential for the Worker to function):
+        ```bash
+        wrangler secret put SLACK_BOT_TOKEN
+        # Paste your Bot User OAuth Token
 
-    Your Python script should load these variables using `os.getenv()` after calling `load_dotenv()` from the `python-dotenv` library.
+        wrangler secret put WEATHER_API_KEY
+        # Paste your OpenWeatherMap API key
 
-## Usage
+        wrangler secret put SLACK_SIGNING_SECRET
+        # Paste your Slack App's Signing Secret (if using slash command)
 
-Once configured, you can run the bot from your terminal:
+        # For the scheduled task:
+        wrangler secret put DEFAULT_LOCATION
+        # e.g., "New York" or "London,UK"
 
+        wrangler secret put SLACK_USER_ID_TO_UPDATE
+        # The Slack Member ID of the user whose status should be auto-updated
+        ```
+
+4.  **Configure `wrangler.toml`:**
+    *   Ensure the `name` field matches your desired worker name.
+    *   Adjust the `crons` schedule in the `[triggers]` section as needed. The default is `["0 * * * *"]` (every hour at minute 0).
+
+## Deployment
+
+Deploy the worker to Cloudflare:
 ```bash
-python your_main_script_name.py
+wrangler deploy
 ```
 
-Replace `your_main_script_name.py` with the actual name of your Python script (e.g., `main.py`, `bot.py`). The bot will then run in the background, periodically checking the weather and updating your Slack status accordingly.
+## How it Works
 
-## How It Works (Example Flow)
+*   **Scheduled Update:**
+    1.  The Cloudflare cron scheduler triggers the `scheduled` function in `src/index.js`.
+    2.  The function reads `DEFAULT_LOCATION` and `SLACK_USER_ID_TO_UPDATE` from environment secrets.
+    3.  It calls `fetchWeather()` to get data from OpenWeatherMap for the `DEFAULT_LOCATION`.
+    4.  It checks if the temperature is > 85°F and it's not raining.
+    5.  If conditions are met, it calls `setSlackUserStatus()` to update the Slack status of `SLACK_USER_ID_TO_UPDATE` to "in a meeting" :calendar: using the `SLACK_BOT_TOKEN`.
 
-1.  The script starts and loads the configuration from environment variables using `python-dotenv`.
-2.  It enters a loop that runs every `CHECK_INTERVAL_SECONDS`.
-3.  Inside the loop:
-    *   It calls the OpenWeather API (using `requests`) to get the current weather for `OPENWEATHER_LOCATION` using `OPENWEATHER_API_KEY` and `OPENWEATHER_UNITS`.
-    *   It extracts the current temperature.
-    *   If the temperature is greater than `TEMPERATURE_THRESHOLD`:
-        *   It calls the Slack API (`users.profile.set`) using `SLACK_USER_TOKEN` (via `slack_sdk`) to update the profile status with `SLACK_STATUS_TEXT_HOT` and `SLACK_STATUS_EMOJI_HOT`.
-    *   Else (if the temperature is not above the threshold):
-        *   It can either clear the Slack status or set it to `SLACK_STATUS_TEXT_NORMAL` and `SLACK_STATUS_EMOJI_NORMAL` if these are defined.
+*   **Slash Command (Optional):**
+    1.  A user types `/weatherstatus <location>` in Slack.
+    2.  Slack sends a POST request to the Worker's URL (configured in the Slack App).
+    3.  The `fetch` handler in `src/index.js` is invoked.
+    4.  (Crucial) It should first verify the request signature using `SLACK_SIGNING_SECRET`.
+    5.  It extracts the `location` and `user_id` (of the invoking user) from the request.
+    6.  It calls `fetchWeather()` for the provided `location`.
+    7.  If conditions are met, it calls `setSlackUserStatus()` for the `user_id` who invoked the command.
+    8.  An ephemeral message is sent back to the user in Slack.
 
-## Customization
+## Important Notes
+*   **Slack Request Verification:** For the `fetch` handler (slash commands), implementing Slack request signature verification is critical for security. The current code has a placeholder for this.
+*   **Error Handling:** Basic error handling is in place, logging to the Worker console and sending error messages to Slack for slash commands.
 
-*   **Location:** Change `OPENWEATHER_LOCATION` to your city, zip code, or coordinates.
-*   **Temperature Threshold:** Adjust `TEMPERATURE_THRESHOLD` and `OPENWEATHER_UNITS` (Fahrenheit/Celsius).
-*   **Slack Status:** Customize `SLACK_STATUS_TEXT_HOT`, `SLACK_STATUS_EMOJI_HOT`, and the optional `_NORMAL` status variables.
-*   **Check Frequency:** Modify `CHECK_INTERVAL_SECONDS` to change how often the weather is checked.
-
-## Example Python Snippets (Conceptual)
-
-Your Python code might include functions similar to these:
-
-```python
-# conceptual example - not runnable as-is
-import os
-import requests
-from slack_sdk import WebClient
-from slack_sdk.errors import SlackApiError
-import time
-from dotenv import load_dotenv # Import load_dotenv
-
-load_dotenv() # Load variables from .env file
-
-# ... (functions to get weather and update Slack status) ...
-```
-
-## Contributing
-
-Contributions, issues, and feature requests are welcome!
-
-## License
-
-This project can be licensed under the MIT License if you choose. (If so, add a `LICENSE` file).
