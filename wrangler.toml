@@ -1,7 +1,6 @@
 name = "slack-weather-app" # Replace with your worker's name
 main = "src/index.js"
-compatibility_date = "2025-06-16 # Use a recent date
-
+compatibility_date = "2025-06-16"
 
 [triggers]
 crons = ["0 * * * *"] # This runs at the start of every hour. Adjust as needed.
